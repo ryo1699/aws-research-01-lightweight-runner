@@ -1,0 +1,9 @@
+.DS_Store
+
+# Terraform local state and machine-specific config
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.*
+infra/terraform/backend.hcl
+infra/terraform/terraform.tfvars
+

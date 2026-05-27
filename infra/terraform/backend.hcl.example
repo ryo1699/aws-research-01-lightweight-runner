@@ -1,0 +1,4 @@
+bucket  = "study-aws-3-terraform-state-ryo1699"
+key     = "study-aws-3/task4/terraform.tfstate"
+region  = "ap-northeast-1"
+encrypt = true

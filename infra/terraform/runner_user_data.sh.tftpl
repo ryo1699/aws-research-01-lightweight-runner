@@ -1,0 +1,73 @@
+#!/bin/bash
+set -euo pipefail
+
+RUNNER_ARCH="${runner_arch}"
+RUNNER_HOME="/opt/actions-runner"
+RUNNER_USER="actions-runner"
+
+dnf install -y docker git jq tar gzip libicu sudo
+systemctl enable --now docker
+
+if ! id "$${RUNNER_USER}" >/dev/null 2>&1; then
+  useradd --create-home --shell /bin/bash "$${RUNNER_USER}"
+fi
+
+usermod -aG docker "$${RUNNER_USER}"
+mkdir -p "$${RUNNER_HOME}"
+chown "$${RUNNER_USER}:$${RUNNER_USER}" "$${RUNNER_HOME}"
+
+if [ ! -x "$${RUNNER_HOME}/config.sh" ]; then
+  latest_url="$(curl -fsSLI -o /dev/null -w '%%{url_effective}' https://github.com/actions/runner/releases/latest)"
+  runner_version="$${latest_url##*/v}"
+  archive="/tmp/actions-runner-linux-$${RUNNER_ARCH}-$${runner_version}.tar.gz"
+
+  curl -fsSL \
+    -o "$${archive}" \
+    "https://github.com/actions/runner/releases/download/v$${runner_version}/actions-runner-linux-$${RUNNER_ARCH}-$${runner_version}.tar.gz"
+
+  tar -xzf "$${archive}" -C "$${RUNNER_HOME}"
+  chown -R "$${RUNNER_USER}:$${RUNNER_USER}" "$${RUNNER_HOME}"
+fi
+
+cat >/usr/local/bin/start-github-runner <<'SCRIPT'
+#!/bin/bash
+set -euo pipefail
+
+if [ "$#" -ne 4 ]; then
+  echo "usage: start-github-runner <repo-url> <registration-token> <runner-name> <runner-labels>" >&2
+  exit 64
+fi
+
+REPO_URL="$1"
+REGISTRATION_TOKEN="$2"
+RUNNER_NAME="$3"
+RUNNER_LABELS="$4"
+RUNNER_HOME="/opt/actions-runner"
+RUNNER_USER="actions-runner"
+
+cd "$${RUNNER_HOME}"
+pkill -u "$${RUNNER_USER}" -f "Runner.Listener" || true
+pkill -u "$${RUNNER_USER}" -f "Runner.Worker" || true
+
+if [ -f .runner ]; then
+  sudo -u "$${RUNNER_USER}" ./config.sh remove --unattended --token "$${REGISTRATION_TOKEN}" || true
+  rm -f .runner .credentials .credentials_rsaparams
+fi
+
+chown -R "$${RUNNER_USER}:$${RUNNER_USER}" "$${RUNNER_HOME}"
+
+sudo -u "$${RUNNER_USER}" ./config.sh \
+  --unattended \
+  --url "$${REPO_URL}" \
+  --token "$${REGISTRATION_TOKEN}" \
+  --name "$${RUNNER_NAME}" \
+  --labels "$${RUNNER_LABELS}" \
+  --ephemeral \
+  --replace \
+  --work _work
+
+nohup sudo -u "$${RUNNER_USER}" ./run.sh >/var/log/github-actions-runner.log 2>&1 &
+SCRIPT
+
+chmod +x /usr/local/bin/start-github-runner
+"$${RUNNER_HOME}/bin/installdependencies.sh" || true
