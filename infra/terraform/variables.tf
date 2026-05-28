@@ -48,7 +48,11 @@ variable "runner_root_volume_size" {
 variable "github_repository" {
   type        = string
   description = "GitHub repository allowed to assume the task 4 OIDC role. Format: owner/repo."
-  default     = "ryo1699/Study_AWS-3"
+
+  validation {
+    condition     = can(regex("^[^/]+/[^/]+$", var.github_repository))
+    error_message = "github_repository must use the owner/repo format."
+  }
 }
 
 variable "github_branch" {

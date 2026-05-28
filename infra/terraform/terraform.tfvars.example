@@ -3,5 +3,5 @@ aws_region              = "ap-northeast-1"
 runner_instance_type    = "t3.small"
 runner_arch             = "x64"
 runner_root_volume_size = 30
-github_repository       = "ryo1699/Study_AWS-3"
+github_repository       = "ryo1699/aws-research-01-lightweight-runner"
 github_branch           = "main"
