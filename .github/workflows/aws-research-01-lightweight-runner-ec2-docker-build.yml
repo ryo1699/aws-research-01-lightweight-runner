@@ -1,0 +1,284 @@
+name: Build Docker Image on EC2 Runner
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - app/**
+      - infra/terraform/**
+      - .github/workflows/aws-research-01-lightweight-runner-ec2-docker-build.yml
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  RUNNER_LABEL: aws-research-01-lightweight-runner
+
+jobs:
+  start-ec2-runner:
+    name: Start EC2 runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      runner-name: ${{ steps.runner.outputs.runner_name }}
+      image-uri: ${{ steps.ecr.outputs.image_uri }}
+    steps:
+      - name: Check required settings
+        env:
+          AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_AWS_ROLE_TO_ASSUME }}
+          GH_RUNNER_TOKEN: ${{ secrets.AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_GH_RUNNER_TOKEN }}
+          AWS_REGION: ${{ vars.AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_AWS_REGION }}
+          RUNNER_INSTANCE_ID: ${{ vars.AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_RUNNER_INSTANCE_ID }}
+          ECR_REPOSITORY: ${{ vars.AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_ECR_REPOSITORY }}
+        run: |
+          set -euo pipefail
+
+          missing=0
+          for name in AWS_ROLE_TO_ASSUME GH_RUNNER_TOKEN AWS_REGION RUNNER_INSTANCE_ID ECR_REPOSITORY; do
+            if [ -z "${!name}" ]; then
+              echo "::error::${name} is not set"
+              missing=1
+            fi
+          done
+
+          if [ "${missing}" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_AWS_REGION }}
+
+      - name: Start EC2 instance
+        env:
+          INSTANCE_ID: ${{ vars.AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_RUNNER_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+
+          state="$(aws ec2 describe-instances \
+            --instance-ids "${INSTANCE_ID}" \
+            --query 'Reservations[0].Instances[0].State.Name' \
+            --output text)"
+
+          echo "Current instance state: ${state}"
+
+          case "${state}" in
+            stopped)
+              aws ec2 start-instances --instance-ids "${INSTANCE_ID}" >/dev/null
+              ;;
+            running)
+              ;;
+            pending|stopping)
+              ;;
+            terminated|shutting-down)
+              echo "::error::Runner instance is ${state}. Update AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_RUNNER_INSTANCE_ID after terraform apply."
+              exit 1
+              ;;
+            *)
+              echo "::error::Unexpected instance state: ${state}"
+              exit 1
+              ;;
+          esac
+
+          aws ec2 wait instance-running --instance-ids "${INSTANCE_ID}"
+
+      - name: Create GitHub runner registration token
+        id: runner
+        env:
+          GH_RUNNER_TOKEN: ${{ secrets.AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_GH_RUNNER_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          runner_name="${RUNNER_LABEL}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          response="$(curl -fsSL \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_RUNNER_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runners/registration-token")"
+
+          registration_token="$(jq -r '.token // empty' <<<"${response}")"
+          expires_at="$(jq -r '.expires_at // empty' <<<"${response}")"
+
+          if [ -z "${registration_token}" ]; then
+            echo "::error::GitHub runner registration token was not returned"
+            exit 1
+          fi
+
+          echo "::add-mask::${registration_token}"
+          echo "runner_name=${runner_name}" >>"${GITHUB_OUTPUT}"
+          echo "registration_token=${registration_token}" >>"${GITHUB_OUTPUT}"
+          echo "Created registration token that expires at ${expires_at}"
+
+      - name: Register runner over SSM
+        id: ssm
+        env:
+          INSTANCE_ID: ${{ vars.AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_RUNNER_INSTANCE_ID }}
+          RUNNER_NAME: ${{ steps.runner.outputs.runner_name }}
+          REGISTRATION_TOKEN: ${{ steps.runner.outputs.registration_token }}
+        run: |
+          set -euo pipefail
+
+          repo_url="https://github.com/${GITHUB_REPOSITORY}"
+          command="sudo /usr/local/bin/start-github-runner '${repo_url}' '${REGISTRATION_TOKEN}' '${RUNNER_NAME}' '${RUNNER_LABEL}'"
+          parameters="$(jq -n --arg command "${command}" '{commands: [$command]}')"
+
+          command_id="$(aws ssm send-command \
+            --instance-ids "${INSTANCE_ID}" \
+            --document-name AWS-RunShellScript \
+            --comment "Register ephemeral GitHub Actions runner ${RUNNER_NAME}" \
+            --parameters "${parameters}" \
+            --query 'Command.CommandId' \
+            --output text)"
+
+          echo "command_id=${command_id}" >>"${GITHUB_OUTPUT}"
+
+      - name: Wait for SSM and runner bootstrap
+        env:
+          INSTANCE_ID: ${{ vars.AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_RUNNER_INSTANCE_ID }}
+          COMMAND_ID: ${{ steps.ssm.outputs.command_id }}
+        run: |
+          set -euo pipefail
+
+          for _ in $(seq 1 60); do
+            status="$(aws ssm get-command-invocation \
+              --command-id "${COMMAND_ID}" \
+              --instance-id "${INSTANCE_ID}" \
+              --query Status \
+              --output text 2>/dev/null || true)"
+
+            case "${status}" in
+              Success)
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut|Cancelling)
+                aws ssm get-command-invocation \
+                  --command-id "${COMMAND_ID}" \
+                  --instance-id "${INSTANCE_ID}" \
+                  --output json || true
+                exit 1
+                ;;
+            esac
+
+            sleep 5
+          done
+
+          echo "::error::SSM command did not finish in time"
+          aws ssm get-command-invocation \
+            --command-id "${COMMAND_ID}" \
+            --instance-id "${INSTANCE_ID}" \
+            --output json || true
+          exit 1
+
+      - name: Wait for runner online
+        env:
+          GH_RUNNER_TOKEN: ${{ secrets.AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_GH_RUNNER_TOKEN }}
+          RUNNER_NAME: ${{ steps.runner.outputs.runner_name }}
+        run: |
+          set -euo pipefail
+
+          for _ in $(seq 1 60); do
+            status="$(curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_RUNNER_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runners" \
+              | jq -r --arg name "${RUNNER_NAME}" '.runners[]? | select(.name == $name) | .status')"
+
+            if [ "${status}" = "online" ]; then
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          echo "::error::Runner ${RUNNER_NAME} did not become online in time"
+          exit 1
+
+      - name: Set image URI
+        id: ecr
+        env:
+          ECR_REPOSITORY: ${{ vars.AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_ECR_REPOSITORY }}
+        run: |
+          set -euo pipefail
+
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+          image_uri="${account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
+          echo "image_uri=${image_uri}" >>"${GITHUB_OUTPUT}"
+
+  build-and-push:
+    name: Build and push Docker image
+    needs: start-ec2-runner
+    runs-on:
+      - self-hosted
+      - aws-research-01-lightweight-runner
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push
+        env:
+          IMAGE_URI: ${{ needs.start-ec2-runner.outputs.image-uri }}
+        run: |
+          set -euo pipefail
+
+          docker build -t "${IMAGE_URI}:${GITHUB_SHA}" -t "${IMAGE_URI}:latest" app
+          docker push "${IMAGE_URI}:${GITHUB_SHA}"
+          docker push "${IMAGE_URI}:latest"
+
+  stop-ec2-runner:
+    name: Stop EC2 runner
+    needs:
+      - start-ec2-runner
+      - build-and-push
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure AWS credentials
+        if: ${{ needs.start-ec2-runner.result != 'skipped' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_AWS_REGION }}
+
+      - name: Stop EC2 instance
+        if: ${{ needs.start-ec2-runner.result != 'skipped' }}
+        env:
+          INSTANCE_ID: ${{ vars.AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_RUNNER_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+
+          state="$(aws ec2 describe-instances \
+            --instance-ids "${INSTANCE_ID}" \
+            --query 'Reservations[0].Instances[0].State.Name' \
+            --output text)"
+
+          echo "Current instance state: ${state}"
+
+          case "${state}" in
+            running|pending)
+              aws ec2 stop-instances --instance-ids "${INSTANCE_ID}" >/dev/null
+              aws ec2 wait instance-stopped --instance-ids "${INSTANCE_ID}"
+              ;;
+            stopped|stopping)
+              ;;
+            *)
+              echo "No stop action for state: ${state}"
+              ;;
+          esac
