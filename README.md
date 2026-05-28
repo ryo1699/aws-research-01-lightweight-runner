@@ -60,7 +60,104 @@ Variables:
 | `AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_RUNNER_INSTANCE_ID` | `terraform output -raw runner_instance_id` |
 | `AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_ECR_REPOSITORY` | `terraform output -raw docker_build_ecr_repository_name` |
 
-`AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_GH_RUNNER_TOKEN` はrepository self-hosted runnerのregistration tokenを作れる権限が必要です。fine-grained tokenを使う場合は対象repositoryを限定し、Administrationのwrite権限を付けます。
+### `AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_GH_RUNNER_TOKEN` の作成方法
+
+ここで設定する値は、GitHub Actions runnerのregistration tokenそのものではなく、registration tokenをGitHub APIで作成するためのGitHub Personal Access Tokenです。
+
+このworkflowでは、`Start EC2 runner` jobの中で次のAPIを呼び出して、一時的なself-hosted runner registration tokenを作成します。
+
+```text
+POST /repos/{owner}/{repo}/actions/runners/registration-token
+```
+
+そのため、`AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_GH_RUNNER_TOKEN` には、このAPIを実行できる権限を持つGitHub tokenを保存します。GitHub公式ドキュメント上、このrepository APIにはfine-grained personal access tokenの場合 `Administration` repository permissionの `write` が必要です。
+
+#### fine-grained personal access tokenを作成する
+
+GitHubの画面で次の順に進みます。
+
+```text
+右上のプロフィール画像
+-> Settings
+-> Developer settings
+-> Personal access tokens
+-> Fine-grained tokens
+-> Generate new token
+```
+
+設定値:
+
+| 項目 | 値 |
+| --- | --- |
+| Token name | `aws-research-01-lightweight-runner` など用途が分かる名前 |
+| Expiration | 任意。長期運用する場合も期限を決め、期限切れ前に更新する |
+| Resource owner | このrepositoryを所有しているuserまたはorganization |
+| Repository access | `Only select repositories` |
+| Selected repositories | このworkflowを置くrepository |
+| Repository permissions > Administration | `Read and write` |
+
+他のrepository permissionsは、この用途だけなら追加しません。
+
+最後に `Generate token` を押し、表示されたtokenをコピーします。GitHubのPersonal Access Tokenは作成直後にしか完全な値を確認できません。あとからGitHub画面で再表示することはできないため、コピーし忘れた場合や値が分からなくなった場合は、既存tokenをregenerateするか、新しいtokenを作り直します。
+
+#### tokenが正しいか確認する
+
+ローカルでtokenを環境変数に入れて、registration token作成APIを試します。
+
+```bash
+export GH_RUNNER_PAT='github_pat_...'
+export GITHUB_OWNER='your-owner'
+export GITHUB_REPO='your-repo'
+
+curl -fsSL \
+  -X POST \
+  -H "Accept: application/vnd.github+json" \
+  -H "Authorization: Bearer ${GH_RUNNER_PAT}" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/actions/runners/registration-token"
+```
+
+成功すると、次のように `token` と `expires_at` が返ります。
+
+```json
+{
+  "token": "...",
+  "expires_at": "2026-05-28T00:00:00Z"
+}
+```
+
+このレスポンスに出る `token` は短命なregistration tokenです。GitHub Secretsに保存する値ではありません。GitHub Secretsに保存するのは、API呼び出しに使った `GH_RUNNER_PAT` の値です。
+
+`403` や `404` が返る場合は、次を確認します。
+
+| 確認項目 | 内容 |
+| --- | --- |
+| Resource owner | token作成時にrepositoryのownerを選んでいるか |
+| Repository access | 対象repositoryが選択されているか |
+| Administration | `Read and write` になっているか |
+| organization approval | organization repositoryの場合、fine-grained tokenの利用承認が必要になっていないか |
+| owner/repo | API URLのownerとrepository名が正しいか |
+
+#### GitHub Secretに保存する
+
+repositoryの画面で次の順に進みます。
+
+```text
+Settings
+-> Secrets and variables
+-> Actions
+-> Secrets
+-> New repository secret
+```
+
+次の値で登録します。
+
+| 項目 | 値 |
+| --- | --- |
+| Name | `AWS_RESEARCH_01_LIGHTWEIGHT_RUNNER_GH_RUNNER_TOKEN` |
+| Secret | 作成したfine-grained personal access tokenの値 |
+
+保存後、Secretの値はGitHub画面では確認できません。値を確認したい場合は、作成元のPersonal Access Token一覧でtoken名、期限、repository access、permissionsを確認します。token文字列そのものが不明な場合は、新しいtokenを作ってSecretを上書きします。
 
 GitHub Actionsがすぐ失敗する場合は、失敗したrunを開いて `Start EC2 runner` jobのどのstepで落ちたか確認します。
 
