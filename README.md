@@ -1,4 +1,4 @@
-# 課題4: EC2上でDocker build用GitHub Actions runnerを動かす
+# 01: EC2上でDocker build用GitHub Actions runnerを動かす
 
 GitHub Actionsの最初のjobでEC2を起動し、SSM経由でEC2を一時的なself-hosted runnerとして登録します。Docker buildとECR pushはEC2 runner上で実行し、最後のjobでEC2を停止します。
 

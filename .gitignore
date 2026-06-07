@@ -7,3 +7,8 @@ infra/terraform/*.tfstate.*
 infra/terraform/backend.hcl
 infra/terraform/terraform.tfvars
 
+
+# Terraform state files
+terraform.tfstate
+*.tfstate
+*.tfstate.*
